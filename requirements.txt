@@ -1,0 +1,9 @@
+numpy
+matplotlib
+scipy
+scikit-learn
+tqdm
+tensorboard
+
+torch==2.7.1
+torchvision==0.22.1
