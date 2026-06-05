@@ -144,21 +144,37 @@ def gradient_penalty(DQ, real_imgs, fake_imgs, device):
     grad_norm = grads.view(B, -1).norm(2, dim=1)
     return torch.mean((grad_norm - 1.) ** 2)
 
-def mi_orig_discrete(c_cat, cat_prob):
-    targets = c_cat.argmax(dim=1)
-    logits  = torch.log(cat_prob + TINY)
-    return F.cross_entropy(logits, targets)
+def _split_categorical(tensor, cat_dims):
+    if len(cat_dims) == 1:
+        return (tensor,)
+    return torch.split(tensor, cat_dims, dim=1)
+
+
+def mi_orig_discrete(c_cat, cat_prob, cat_dims):
+    losses = []
+    for c_i, p_i in zip(_split_categorical(c_cat, cat_dims),
+                        _split_categorical(cat_prob, cat_dims)):
+        targets = c_i.argmax(dim=1)
+        logits = torch.log(p_i + TINY)
+        losses.append(F.cross_entropy(logits, targets))
+    return torch.stack(losses).mean()
 
 def mi_orig_continuous(c_cont, cont_mean, cont_std):
+    if c_cont.numel() == 0:
+        return c_cont.new_tensor(0.0)
     nll = (torch.log(cont_std + TINY)
            + 0.5 * ((c_cont - cont_mean) / (cont_std + TINY)) ** 2)
     return nll.mean()
 
-def mi_infonce_discrete(c_cat, cat_prob, temperature=0.1):
-    log_q  = torch.log(cat_prob + TINY)
-    logits = torch.matmul(log_q, c_cat.T) / temperature
-    targets = torch.arange(c_cat.size(0), device=c_cat.device)
-    return F.cross_entropy(logits, targets)
+def mi_infonce_discrete(c_cat, cat_prob, cat_dims, temperature=0.1):
+    losses = []
+    for c_i, p_i in zip(_split_categorical(c_cat, cat_dims),
+                        _split_categorical(cat_prob, cat_dims)):
+        log_q = torch.log(p_i + TINY)
+        logits = torch.matmul(log_q, c_i.T) / temperature
+        targets = torch.arange(c_i.size(0), device=c_i.device)
+        losses.append(F.cross_entropy(logits, targets))
+    return torch.stack(losses).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +199,9 @@ class InfoGANTrainer:
         self.parse_q_output = m.parse_q_output
         self.NOISE_DIM      = m.NOISE_DIM
         self.CAT_DIM        = m.CAT_DIM
+        self.CAT_DIMS       = getattr(m, 'CAT_DIMS', (m.CAT_DIM,))
         self.CONT_DIM       = m.CONT_DIM
+        self.IMAGE_VALUE_RANGE = getattr(m, 'IMAGE_VALUE_RANGE', (0, 1))
 
         # ── networks ────────────────────────────────────────────────────────
         self.G  = m.Generator().to(self.device)
@@ -224,19 +242,37 @@ class InfoGANTrainer:
     # -----------------------------------------------------------------------
 
     def _make_fixed_latents(self):
-        B      = 100
         device = self.device
         NOISE_DIM = self.NOISE_DIM
-        CAT_DIM   = self.CAT_DIM
         CONT_DIM  = self.CONT_DIM
 
-        base  = torch.FloatTensor(10, NOISE_DIM).uniform_(-1, 1)
-        noise = base.repeat_interleave(10, dim=0).to(device)
-        c_cat = torch.zeros(B, CAT_DIM, device=device)
-        for i in range(10):
-            c_cat[i*10:(i+1)*10, i] = 1.0
+        first_cat_dim = self.CAT_DIMS[0]
+        B = first_cat_dim * 10
+        base = torch.empty(10, NOISE_DIM, device=device).uniform_(-1, 1)
+        noise = base.repeat(first_cat_dim, 1)
+        c_cat = self._make_cat_traversal(0, B)
         c_cont = torch.zeros(B, CONT_DIM, device=device)
         return noise, c_cat, c_cont
+
+    def _make_cat_traversal(self, code_idx, batch_size):
+        cat_dim = self.CAT_DIMS[code_idx]
+        n_cols = batch_size // cat_dim
+        c_cat = torch.zeros(batch_size, self.CAT_DIM, device=self.device)
+
+        offset = 0
+        for dim in self.CAT_DIMS:
+            c_cat[:, offset] = 1.0
+            offset += dim
+
+        start = sum(self.CAT_DIMS[:code_idx])
+        c_cat[:, start:start + cat_dim] = 0.0
+        for value in range(cat_dim):
+            row = slice(value * n_cols, (value + 1) * n_cols)
+            c_cat[row, start + value] = 1.0
+        return c_cat
+
+    def _cat_entropy_target(self):
+        return sum(math.log(dim) for dim in self.CAT_DIMS) / len(self.CAT_DIMS)
 
     # -----------------------------------------------------------------------
     # MI loss selector
@@ -244,9 +280,10 @@ class InfoGANTrainer:
 
     def _mi_loss(self, c_cat, cat_prob, c_cont, cont_mean, cont_std):
         if self.cfg.use_infonce:
-            mi_disc = mi_infonce_discrete(c_cat, cat_prob, self.cfg.infonce_temp)
+            mi_disc = mi_infonce_discrete(c_cat, cat_prob, self.CAT_DIMS,
+                                          self.cfg.infonce_temp)
         else:
-            mi_disc = mi_orig_discrete(c_cat, cat_prob)
+            mi_disc = mi_orig_discrete(c_cat, cat_prob, self.CAT_DIMS)
         mi_cont = mi_orig_continuous(c_cont, cont_mean, cont_std)
         return mi_disc, mi_cont
 
@@ -295,11 +332,11 @@ class InfoGANTrainer:
         mi_disc_g, mi_cont_g = self._mi_loss(c_cat, cat_prob_g, c_cont,
                                               cont_mean_g, cont_std_g)
         mi_total_g = cfg.lambda_disc * mi_disc_g + cfg.lambda_cont * mi_cont_g
-        (g_loss - mi_total_g).backward()
+        (g_loss + mi_total_g).backward()
         self.opt_G.step()
 
         with torch.no_grad():
-            li_disc = math.log(self.CAT_DIM) - mi_disc.item()
+            li_disc = self._cat_entropy_target() - mi_disc.item()
 
         return {
             'd_loss' : d_loss.item(),
@@ -319,27 +356,52 @@ class InfoGANTrainer:
         z = self.concat_latent(self.fixed_noise, self.fixed_c_cat,
                                 self.fixed_c_cont)
         imgs = self.G(z)
-        grid = make_grid(imgs, nrow=10, normalize=True, value_range=(0, 1))
+        grid = make_grid(imgs, nrow=10, normalize=True,
+                         value_range=self.IMAGE_VALUE_RANGE)
         self.writer.add_image('traversal/c1_category', grid, epoch)
 
         NOISE_DIM = self.NOISE_DIM
-        CAT_DIM   = self.CAT_DIM
         CONT_DIM  = self.CONT_DIM
         device    = self.device
 
-        c0  = torch.zeros(10, CAT_DIM, device=device); c0[:, 0] = 1.
-        zn  = torch.zeros(10, NOISE_DIM, device=device)
+        if len(self.CAT_DIMS) > 1:
+            cat_dim = self.CAT_DIMS[0]
+            base = torch.empty(10, NOISE_DIM, device=device).uniform_(-1, 1)
+            zn = base.repeat(cat_dim, 1)
+            c_cont = torch.zeros(zn.size(0), CONT_DIM, device=device)
+
+            for code_idx in range(len(self.CAT_DIMS)):
+                c_cat = self._make_cat_traversal(code_idx, zn.size(0))
+                imgs_cat = self.G(self.concat_latent(zn, c_cat, c_cont))
+                self.writer.add_image(
+                    f'traversal/cat_{code_idx:02d}',
+                    make_grid(imgs_cat, nrow=10, normalize=True,
+                              value_range=self.IMAGE_VALUE_RANGE),
+                    epoch,
+                )
+
+        if CONT_DIM == 0:
+            self.G.train()
+            return
+
+        c0 = torch.zeros(10, self.CAT_DIM, device=device)
+        offset = 0
+        for dim in self.CAT_DIMS:
+            c0[:, offset] = 1.
+            offset += dim
+        zn = torch.zeros(10, NOISE_DIM, device=device)
         sweep = torch.linspace(-2, 2, 10, device=device)
 
-        cc2 = torch.zeros(10, CONT_DIM, device=device); cc2[:, 0] = sweep
-        imgs_c2 = self.G(self.concat_latent(zn, c0, cc2))
-        self.writer.add_image('traversal/c2_rotation',
-            make_grid(imgs_c2, nrow=10, normalize=True, value_range=(0,1)), epoch)
-
-        cc3 = torch.zeros(10, CONT_DIM, device=device); cc3[:, 1] = sweep
-        imgs_c3 = self.G(self.concat_latent(zn, c0, cc3))
-        self.writer.add_image('traversal/c3_width',
-            make_grid(imgs_c3, nrow=10, normalize=True, value_range=(0,1)), epoch)
+        for cont_idx in range(CONT_DIM):
+            c_cont = torch.zeros(10, CONT_DIM, device=device)
+            c_cont[:, cont_idx] = sweep
+            imgs_cont = self.G(self.concat_latent(zn, c0, c_cont))
+            self.writer.add_image(
+                f'traversal/cont_{cont_idx:02d}',
+                make_grid(imgs_cont, nrow=10, normalize=True,
+                          value_range=self.IMAGE_VALUE_RANGE),
+                epoch,
+            )
 
         self.G.train()
 
@@ -376,7 +438,7 @@ class InfoGANTrainer:
             print(f"Epoch {epoch:03d} | "
                   f"D={avg['d_loss']:.4f}  G={avg['g_loss']:.4f}  "
                   f"MI={avg['mi_disc']:.4f}  LI={avg['LI_disc']:.4f}  "
-                  f"target≈{math.log(self.CAT_DIM):.3f}")
+                  f"target≈{self._cat_entropy_target():.3f}")
             for k, v in avg.items():
                 self.writer.add_scalar(f'train/{k}', v, epoch)
 
