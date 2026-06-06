@@ -460,25 +460,37 @@ class InfoGANTrainer:
             'DQ_state'    : self.DQ.state_dict(),
             'opt_G_state' : self.opt_G.state_dict(),
             'opt_DQ_state': self.opt_DQ.state_dict(),
-            'rng_state'   : torch.get_rng_state(),         
+            'rng_state'   : torch.get_rng_state().cpu().to(torch.uint8), 
             'cuda_rng_state': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         }, path)
         print(f'  Checkpoint → {path}')
 
 
     def load_checkpoint(self, path):
-        ckpt = torch.load(path, map_location=self.device)
+        ckpt = torch.load(path, map_location='cpu')
         
         self.G.load_state_dict(ckpt['G_state'])
         self.DQ.load_state_dict(ckpt['DQ_state'])
-        
         self.opt_G.load_state_dict(ckpt['opt_G_state'])
         self.opt_DQ.load_state_dict(ckpt['opt_DQ_state'])
         
-        if 'rng_state' in ckpt and ckpt['rng_state'] is not None:
+        self.G.to(self.device)
+        self.DQ.to(self.device)
+        for state in self.opt_G.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(self.device)
+        for state in self.opt_DQ.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(self.device)
+        
+        if 'rng_state' in ckpt:
             torch.set_rng_state(ckpt['rng_state'])
+        
         if 'cuda_rng_state' in ckpt and ckpt['cuda_rng_state'] is not None:
-            torch.cuda.set_rng_state_all(ckpt['cuda_rng_state'])
+            cuda_states = [s.cpu() for s in ckpt['cuda_rng_state']]  # 确保在 CPU
+            torch.cuda.set_rng_state_all(cuda_states)
         
         print(f'  Checkpoint ← {path}  (epoch {ckpt["epoch"]})')
         return ckpt['epoch']
