@@ -23,9 +23,8 @@ Examples:
 """
 
 import argparse
-from trainer import InfoGANTrainer, TrainerConfig, VALID_MODES
 import torch
-
+from trainer_v import InfoGANTrainer, TrainerConfig, VALID_MODES
 
 
 def parse_args():
@@ -41,16 +40,14 @@ def parse_args():
     p.add_argument('--ckpt_dir',   type=str, default='./checkpoints')
     p.add_argument('--lr_d',       type=float, default=2e-4)
     p.add_argument('--lr_g',       type=float, default=1e-3)
-    p.add_argument('--lambda_gp',  type=float, default=10.0,
-                   help='gradient penalty weight (wgan_gp modes only)')
-    p.add_argument('--lambda_disc',type=float, default=1.0,
-                   help='MI loss weight for discrete code')
-    p.add_argument('--lambda_cont',type=float, default=0.1,
-                   help='MI loss weight for continuous codes')
-    p.add_argument('--infonce_temp',type=float, default=0.1,
-                   help='InfoNCE temperature τ (infonce modes only)')
+    p.add_argument('--lambda_gp',  type=float, default=10.0)
+    p.add_argument('--lambda_disc',type=float, default=1.0)
+    p.add_argument('--lambda_cont',type=float, default=0.1)
+    p.add_argument('--infonce_temp',type=float, default=0.1)
     p.add_argument('--resume',     type=str, default=None,
                    help='path to .pt checkpoint to resume from')
+    p.add_argument('--start_epoch',type=int, default=None,
+                   help='override start epoch when resuming (default: checkpoint epoch + 1)')
     return p.parse_args()
 
 
@@ -64,16 +61,13 @@ def main():
         resumed_epoch   = ckpt.get('epoch', -1)
         
         if args.dataset != 'mnist' and args.dataset != resumed_dataset:
-            print(f"[Warning] Command line --dataset {args.dataset} conflicts with "
-                  f"checkpoint dataset '{resumed_dataset}'. Using checkpoint value.")
+            print(f"[Warning] Overriding --dataset {args.dataset} -> {resumed_dataset}")
         if args.mode != 'vanilla' and args.mode != resumed_mode:
-            print(f"[Warning] Command line --mode {args.mode} conflicts with "
-                  f"checkpoint mode '{resumed_mode}'. Using checkpoint value.")
+            print(f"[Warning] Overriding --mode {args.mode} -> {resumed_mode}")
         
         args.dataset = resumed_dataset
         args.mode    = resumed_mode
-        print(f"[Resume] Loaded config from checkpoint: dataset={resumed_dataset}, "
-              f"mode={resumed_mode}, epoch={resumed_epoch}")
+        print(f"[Resume] Checkpoint: dataset={resumed_dataset}, mode={resumed_mode}, epoch={resumed_epoch}")
 
     cfg = TrainerConfig(
         mode            = args.mode,
@@ -94,10 +88,14 @@ def main():
     trainer = InfoGANTrainer(cfg)
 
     if args.resume:
-        start_epoch = trainer.load_checkpoint(args.resume)
-        print(f"[Resume] Training will continue from epoch {start_epoch + 1}")
-
-    trainer.train()
+        ckpt_epoch = trainer.load_checkpoint(args.resume)
+        
+        start_epoch = args.start_epoch if args.start_epoch is not None else ckpt_epoch + 1
+        print(f"[Resume] Will continue from epoch {start_epoch} (total epochs: {cfg.max_epochs})")
+        
+        trainer.train(start_epoch=start_epoch)
+    else:
+        trainer.train()
 
 
 if __name__ == '__main__':
