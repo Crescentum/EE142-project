@@ -1,23 +1,24 @@
 """
 visualize.py — All visualisations needed for the IEEE report.
 
+Supports both MNIST (1 cat code, 2 cont codes, grayscale) and
+SVHN (4 cat codes, 4 cont codes, RGB).
+
 Functions:
     plot_latent_traversal   : 10×10 grid varying one latent code at a time
-                              → reproduces Figure 2 of the paper
     plot_mi_curve           : L_I convergence curve (InfoGAN vs GAN baseline)
-                              → reproduces Figure 1 of the paper
     plot_loss_curves        : D/G loss over training (diagnostic)
     compute_classification_error : cluster c1 → digit, report error rate
-                              → reproduces the "5% error" claim in Section 7.2
     save_comparison_grid    : side-by-side real vs generated images
 
 Usage:
     from visualize import plot_latent_traversal, compute_classification_error
-    plot_latent_traversal(G, device, save_path='results/traversal.png')
+    plot_latent_traversal(G, DQ, device, dataset='svhn', save_path='results/traversal.png')
 """
 
 import os
 import math
+import importlib
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')           # no display needed on cluster
@@ -29,21 +30,30 @@ import torch
 import torch.nn.functional as F
 from torchvision.utils import make_grid
 
-from models import (
-    Generator, DiscriminatorQ,
-    sample_latent, concat_latent, parse_q_output,
-    NOISE_DIM, CAT_DIM, CONT_DIM,
-)
-from datasets import DATASET_CFG, denorm
+
+# ---------------------------------------------------------------------------
+# Dynamic model import
+# ---------------------------------------------------------------------------
+
+def _load_model_module(dataset: str):
+    module_name = f"model_{dataset}"
+    try:
+        return importlib.import_module(module_name)
+    except ModuleNotFoundError:
+        raise ModuleNotFoundError(f"Cannot find '{module_name}.py'")
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _to_numpy_img(tensor: torch.Tensor) -> np.ndarray:
-    """(C,H,W) tensor in [0,1] → (H,W,C) or (H,W) numpy array."""
-    img = tensor.cpu().clamp(0, 1).numpy()
+def _to_numpy_img(tensor: torch.Tensor, value_range=(-1, 1)) -> np.ndarray:
+    """(C,H,W) tensor → (H,W,C) or (H,W) numpy array in [0,1]."""
+    # Normalize to [0,1] if needed
+    low, high = value_range
+    img = tensor.cpu().float().numpy()
+    img = (img - low) / (high - low)
+    img = np.clip(img, 0, 1)
     if img.shape[0] == 1:
         return img[0]           # grayscale → (H,W)
     return img.transpose(1, 2, 0)   # RGB → (H,W,C)
@@ -53,87 +63,94 @@ def _ensure_dir(path: str):
     os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
 
 
+def _get_value_range(dataset: str):
+    """Return (min, max) pixel values for generated images."""
+    # MNIST uses Sigmoid → [0,1]; SVHN uses Tanh → [-1,1]
+    return (-1, 1) if dataset == 'svhn' else (0, 1)
+
+
 # ---------------------------------------------------------------------------
-# 1. Latent traversal grid  (Figure 2 in the paper)
+# 1. Latent traversal grid  (Figure 2 / Figure 5 in the paper)
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def plot_latent_traversal(
-    G           : Generator,
+    G,
     device      : torch.device,
     dataset     : str  = 'mnist',
-    n_rows      : int  = 10,        # one row per category / sweep step
-    n_cols      : int  = 10,        # samples per row (different z_noise)
-    cont_range  : float = 2.0,      # sweep continuous codes from -range to +range
+    n_rows      : int  = 10,
+    n_cols      : int  = 10,
+    cont_range  : float = 2.0,
     save_path   : str  = 'results/traversal.png',
-    pixel_range : str  = '01',
 ):
     """
-    Reproduce Figure 2 of the InfoGAN paper.
+    Reproduce latent traversal figures from the InfoGAN paper.
 
-    Generates four sub-figures:
-      (a) Varying c1 (categorical) — each row = one category
-      (b) Varying c2 (continuous)  — left-to-right sweep from -range to +range
-      (c) Varying c3 (continuous)  — left-to-right sweep from -range to +range
-      (d) GAN baseline (same z, no MI regularisation effect visible)
-
-    All other latent variables are fixed within each sub-figure.
+    For MNIST: 1 categorical + 2 continuous codes.
+    For SVHN:  4 categorical + 4 continuous codes (only first cat & first 2 cont shown).
     """
     _ensure_dir(save_path)
     G.eval()
-    meta = DATASET_CFG[dataset]
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    fig.suptitle('InfoGAN latent traversal', fontsize=14, y=1.01)
+    m = _load_model_module(dataset)
+    NOISE_DIM  = m.NOISE_DIM
+    CAT_DIM    = m.CAT_DIM
+    CONT_DIM   = m.CONT_DIM
+    N_CATS     = getattr(m, 'N_CATS', 1)
+    concat_latent = m.concat_latent
+    value_range = _get_value_range(dataset)
 
-    # ── (a) vary c1 — categorical ──────────────────────────────────────────
+    # Determine number of subplots: 1 (cat) + min(2, CONT_DIM) cont traversals
+    n_cont_show = min(2, CONT_DIM)
+    n_subplots = 1 + n_cont_show
+
+    fig, axes = plt.subplots(1, n_subplots, figsize=(6 * n_subplots, 6))
+    if n_subplots == 1:
+        axes = [axes]
+    fig.suptitle(f'InfoGAN latent traversal ({dataset.upper()})', fontsize=14, y=1.01)
+
+    # ── (a) vary first categorical code c1 ────────────────────────────────
     fixed_noise = torch.FloatTensor(n_cols, NOISE_DIM).uniform_(-1, 1).to(device)
-    # same noise for all rows, only c1 differs
-    z_noise = fixed_noise.repeat(n_rows, 1)        # (100, 62)
+    z_noise = fixed_noise.repeat(n_rows, 1)        # (100, NOISE_DIM)
 
-    c_cat = torch.zeros(n_rows * n_cols, CAT_DIM, device=device)
+    # Build c_cat: vary first categorical code, fix others to class 0
+    c_cat = torch.zeros(n_rows * n_cols, N_CATS * CAT_DIM, device=device)
     for row in range(n_rows):
-        c_cat[row * n_cols:(row + 1) * n_cols, row] = 1.0
+        c_cat[row * n_cols:(row + 1) * n_cols, row] = 1.0  # first code = row
+        for j in range(1, N_CATS):
+            c_cat[row * n_cols:(row + 1) * n_cols, j * CAT_DIM] = 1.0
 
     c_cont = torch.zeros(n_rows * n_cols, CONT_DIM, device=device)
     z = concat_latent(z_noise, c_cat, c_cont)
     imgs_cat = G(z)
-    imgs_cat = denorm(imgs_cat, pixel_range)
 
-    _plot_grid(axes[0], imgs_cat, n_rows, n_cols, pixel_range,
-               title='(a) Varying $c_1$ — digit type')
+    _plot_grid(axes[0], imgs_cat, n_rows, n_cols, value_range,
+               title='(a) Varying $c_1$ — categorical')
 
-    # ── (b) vary c2 — continuous (e.g. rotation) ──────────────────────────
-    # Fix z_noise and c1 (class 0), sweep c2
+    # ── (b, c) vary continuous codes ────────────────────────────────────
     base_noise = torch.FloatTensor(1, NOISE_DIM).uniform_(-1, 1).to(device)
-    z_noise_b  = base_noise.expand(n_rows * n_cols, -1)
-
-    c_cat_b    = torch.zeros(n_rows * n_cols, CAT_DIM, device=device)
-    c_cat_b[:, 0] = 1.0                           # all class-0
-
-    c2_vals    = torch.linspace(-cont_range, cont_range, n_cols, device=device)
-    c_cont_b   = torch.zeros(n_rows * n_cols, CONT_DIM, device=device)
-    # different z_noise per row (to show generalisation across shapes)
     row_noises = torch.FloatTensor(n_rows, NOISE_DIM).uniform_(-1, 1).to(device)
     z_noise_b2 = row_noises.repeat_interleave(n_cols, dim=0)
-    for row in range(n_rows):
-        c_cont_b[row * n_cols:(row + 1) * n_cols, 0] = c2_vals   # sweep c2
 
-    z_b = concat_latent(z_noise_b2, c_cat_b, c_cont_b)
-    imgs_c2 = G(z_b)
-    imgs_c2 = denorm(imgs_c2, pixel_range)
-    _plot_grid(axes[1], imgs_c2, n_rows, n_cols, pixel_range,
-               title=f'(b) Varying $c_2$ ∈ [{-cont_range}, {cont_range}] — rotation')
+    # Fix first categorical code to class 0, others to class 0
+    c_cat_b = torch.zeros(n_rows * n_cols, N_CATS * CAT_DIM, device=device)
+    c_cat_b[:, 0] = 1.0
+    for j in range(1, N_CATS):
+        c_cat_b[:, j * CAT_DIM] = 1.0
 
-    # ── (c) vary c3 — continuous (e.g. width) ─────────────────────────────
-    c_cont_c   = torch.zeros(n_rows * n_cols, CONT_DIM, device=device)
-    for row in range(n_rows):
-        c_cont_c[row * n_cols:(row + 1) * n_cols, 1] = c2_vals   # sweep c3
-    z_c = concat_latent(z_noise_b2, c_cat_b, c_cont_c)
-    imgs_c3 = G(z_c)
-    imgs_c3 = denorm(imgs_c3, pixel_range)
-    _plot_grid(axes[2], imgs_c3, n_rows, n_cols, pixel_range,
-               title=f'(c) Varying $c_3$ ∈ [{-cont_range}, {cont_range}] — width')
+    sweep = torch.linspace(-cont_range, cont_range, n_cols, device=device)
+
+    for ci in range(n_cont_show):
+        c_cont_b = torch.zeros(n_rows * n_cols, CONT_DIM, device=device)
+        for row in range(n_rows):
+            c_cont_b[row * n_cols:(row + 1) * n_cols, ci] = sweep
+
+        z_b = concat_latent(z_noise_b2, c_cat_b, c_cont_b)
+        imgs_ci = G(z_b)
+
+        labels = ['rotation', 'width', 'cont2', 'cont3']
+        _plot_grid(axes[1 + ci], imgs_ci, n_rows, n_cols, value_range,
+                   title=f'(b) Varying $c_{{ci+2}}$ ∈ [{-cont_range}, {cont_range}] — {labels[ci]}')
 
     plt.tight_layout()
     plt.savefig(save_path, bbox_inches='tight', dpi=150)
@@ -142,10 +159,11 @@ def plot_latent_traversal(
 
 
 def _plot_grid(ax, imgs: torch.Tensor, n_rows: int, n_cols: int,
-               pixel_range: str, title: str):
+               value_range: tuple, title: str):
     """Helper: render a (n_rows*n_cols, C, H, W) tensor as a grid on ax."""
-    grid = make_grid(imgs, nrow=n_cols, normalize=False, padding=2)
-    img_np = _to_numpy_img(grid)
+    low, high = value_range
+    grid = make_grid(imgs, nrow=n_cols, normalize=True, value_range=value_range, padding=2)
+    img_np = _to_numpy_img(grid, value_range=value_range)
     cmap = 'gray' if img_np.ndim == 2 else None
     ax.imshow(img_np, cmap=cmap, vmin=0, vmax=1)
     ax.set_title(title, fontsize=11)
@@ -157,21 +175,14 @@ def _plot_grid(ax, imgs: torch.Tensor, n_rows: int, n_cols: int,
 # ---------------------------------------------------------------------------
 
 def plot_mi_curve(
-    li_infogan  : list,     # L_I values per epoch for InfoGAN
-    li_baseline : list,     # L_I values per epoch for plain GAN (no MI reg)
+    li_infogan  : list,
+    li_baseline : list,
+    cat_dim     : int = 10,
     save_path   : str = 'results/mi_curve.png',
 ):
-    """
-    Reproduce Figure 1: L_I lower bound over training iterations.
-
-    Args:
-        li_infogan  : list of average L_I per epoch from InfoGAN training
-        li_baseline : list from a GAN trained without MI regularisation
-        save_path   : output PNG path
-    """
+    """Reproduce Figure 1: L_I lower bound over training iterations."""
     _ensure_dir(save_path)
-    target = math.log(CAT_DIM)       # H(c1) = log(10) ≈ 2.303
-
+    target = math.log(cat_dim)
     epochs = range(len(li_infogan))
 
     fig, ax = plt.subplots(figsize=(7, 4))
@@ -179,10 +190,10 @@ def plot_mi_curve(
     ax.plot(epochs, li_baseline, label='GAN (baseline)',
             color='#888780', linewidth=1.5, linestyle='--')
     ax.axhline(target, color='#E24B4A', linewidth=1, linestyle=':',
-               label=f'H(c) = log(10) ≈ {target:.3f}')
+               label=f'H(c) = log({cat_dim}) ≈ {target:.3f}')
 
     ax.set_xlabel('Epoch', fontsize=12)
-    ax.set_ylabel('$\\mathcal{L}_I$ (lower bound)', fontsize=12)
+    ax.set_ylabel('$\mathcal{L}_I$ (lower bound)', fontsize=12)
     ax.set_title('Mutual information lower bound over training', fontsize=13)
     ax.legend(fontsize=11)
     ax.grid(alpha=0.3)
@@ -199,14 +210,12 @@ def plot_mi_curve(
 # ---------------------------------------------------------------------------
 
 def plot_loss_curves(
-    history   : dict,       # {'d_loss': [...], 'g_loss': [...], 'LI_disc': [...]}
+    history   : dict,
     mode      : str = 'vanilla',
+    cat_dim   : int = 10,
     save_path : str = 'results/loss_curves.png',
 ):
-    """
-    Plot D loss, G loss, and L_I over epochs for one training run.
-    Pass the history dict that trainer.py accumulates.
-    """
+    """Plot D loss, G loss, and L_I over epochs."""
     _ensure_dir(save_path)
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     fig.suptitle(f'Training curves — mode: {mode}', fontsize=13)
@@ -214,7 +223,7 @@ def plot_loss_curves(
     keys_titles = [
         ('d_loss',  'Discriminator loss'),
         ('g_loss',  'Generator loss'),
-        ('LI_disc', '$\\mathcal{L}_I$ (MI lower bound)'),
+        ('LI_disc', '$\mathcal{L}_I$ (MI lower bound)'),
     ]
     colours = ['#E24B4A', '#1D9E75', '#185FA5']
 
@@ -225,9 +234,9 @@ def plot_loss_curves(
         vals = history[key]
         ax.plot(vals, color=col, linewidth=1.5)
         if key == 'LI_disc':
-            ax.axhline(math.log(CAT_DIM), color='#888780',
+            ax.axhline(math.log(cat_dim), color='#888780',
                        linestyle='--', linewidth=1,
-                       label=f'target ≈ {math.log(CAT_DIM):.3f}')
+                       label=f'target ≈ {math.log(cat_dim):.3f}')
             ax.legend(fontsize=9)
         ax.set_title(title, fontsize=11)
         ax.set_xlabel('Epoch', fontsize=10)
@@ -240,31 +249,27 @@ def plot_loss_curves(
 
 
 # ---------------------------------------------------------------------------
-# 4. Classification error rate  (Section 7.2 claim: ~5% on MNIST)
+# 4. Classification error rate  (MNIST only, Section 7.2)
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def compute_classification_error(
-    G          : Generator,
-    DQ         : DiscriminatorQ,
-    dataloader,             # MNIST test loader
+    G,
+    DQ,
+    dataloader,
     device     : torch.device,
+    dataset    : str = 'mnist',
     n_batches  : int = 20,
 ) -> float:
     """
-    Evaluate how well c1 (categorical code) recovers digit identity.
-
-    Method (paper Section 7.2):
-      1. For each real image x, forward through Q to get the predicted
-         category argmax(Q(c1|x)).
-      2. Build a confusion matrix between predicted cluster and true label.
-      3. Use the Hungarian algorithm to find the optimal cluster→digit
-         assignment (since c1 categories are inherently unordered).
-      4. Report classification error = 1 - accuracy after optimal assignment.
-
-    Returns:
-        error_rate : float in [0, 1]
+    Evaluate how well the FIRST categorical code c1 recovers digit identity.
+    Only meaningful for MNIST (single categorical code = digit class).
     """
+    m = _load_model_module(dataset)
+    CAT_DIM = m.CAT_DIM
+    N_CATS  = getattr(m, 'N_CATS', 1)
+    parse_q_output = m.parse_q_output
+
     G.eval()
     DQ.eval()
 
@@ -277,21 +282,25 @@ def compute_classification_error(
         imgs = imgs.to(device)
         _, q_out = DQ(imgs)
         cat_prob, _, _ = parse_q_output(q_out)
-        pred_cluster = cat_prob.argmax(dim=1).cpu().numpy()
+
+        # For multiple categorical codes, use the first one
+        if isinstance(cat_prob, list):
+            pred_cluster = cat_prob[0].argmax(dim=1).cpu().numpy()
+        else:
+            pred_cluster = cat_prob.argmax(dim=1).cpu().numpy()
+
         all_pred.extend(pred_cluster.tolist())
         all_label.extend(labels.numpy().tolist())
 
     all_pred  = np.array(all_pred)
     all_label = np.array(all_label)
 
-    n_classes = CAT_DIM   # 10
-    # Build cost matrix (negate count for minimisation)
+    n_classes = CAT_DIM
     cost = np.zeros((n_classes, n_classes), dtype=np.int64)
     for p, l in zip(all_pred, all_label):
         if l < n_classes:
             cost[p, l] += 1
 
-    # Hungarian algorithm: maximise total count = minimise -count
     row_ind, col_ind = linear_sum_assignment(-cost)
     correct = cost[row_ind, col_ind].sum()
     total   = len(all_pred)
@@ -303,42 +312,43 @@ def compute_classification_error(
 
 
 # ---------------------------------------------------------------------------
-# 5. Mode comparison grid  (vanilla vs wgan_gp vs infonce)
+# 5. Mode comparison grid
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def plot_mode_comparison(
-    generators  : dict,     # {'vanilla': G1, 'wgan_gp': G2, 'infonce': G3}
+    generators  : dict,
     device      : torch.device,
-    pixel_range : str  = '01',
+    dataset     : str = 'mnist',
     n_samples   : int  = 10,
     save_path   : str  = 'results/mode_comparison.png',
 ):
-    """
-    Side-by-side comparison of generated samples from different training modes.
-    Each row = one mode; columns = samples with the same latent code.
-    """
+    """Side-by-side comparison of generated samples from different training modes."""
     _ensure_dir(save_path)
+
+    m = _load_model_module(dataset)
+    sample_latent = m.sample_latent
+    concat_latent = m.concat_latent
+    value_range = _get_value_range(dataset)
 
     z_noise, c_cat, c_cont = sample_latent(n_samples, device)
     z = concat_latent(z_noise, c_cat, c_cont)
 
     n_modes = len(generators)
-    fig, axes = plt.subplots(n_modes, 1,
-                             figsize=(n_samples * 0.8, n_modes * 1.2))
+    fig, axes = plt.subplots(n_modes, 1, figsize=(n_samples * 0.8, n_modes * 1.2))
     if n_modes == 1:
         axes = [axes]
 
     for ax, (mode_name, G) in zip(axes, generators.items()):
         G.eval()
         imgs = G(z)
-        imgs = denorm(imgs, pixel_range)
-        grid = make_grid(imgs, nrow=n_samples, normalize=False, padding=2)
-        img_np = _to_numpy_img(grid)
-        cmap   = 'gray' if img_np.ndim == 2 else None
+        grid = make_grid(imgs, nrow=n_samples, normalize=True,
+                         value_range=value_range, padding=2)
+        img_np = _to_numpy_img(grid, value_range=value_range)
+        cmap = 'gray' if img_np.ndim == 2 else None
         ax.imshow(img_np, cmap=cmap, vmin=0, vmax=1)
         ax.set_ylabel(mode_name, fontsize=11, rotation=0,
-                      labelpad=60, va='center')
+                    labelpad=60, va='center')
         ax.axis('off')
 
     fig.suptitle('Generated samples — same latent code across modes', fontsize=12)
@@ -349,28 +359,38 @@ def plot_mode_comparison(
 
 
 # ---------------------------------------------------------------------------
-# 6. Ablation: lambda sweep  (how λ affects disentanglement)
+# 6. Ablation: lambda sweep
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def plot_lambda_ablation(
-    generators  : dict,     # {'λ=0.1': G1, 'λ=1.0': G2, 'λ=5.0': G3}
+    generators  : dict,
     device      : torch.device,
-    pixel_range : str = '01',
+    dataset     : str = 'mnist',
     save_path   : str = 'results/lambda_ablation.png',
 ):
-    """
-    Show how the MI regularisation weight λ affects disentanglement.
-    Generates the c1-traversal grid for each λ value side by side.
-    """
+    """Show how the MI regularisation weight λ affects disentanglement."""
     _ensure_dir(save_path)
     n_models = len(generators)
 
+    m = _load_model_module(dataset)
+    NOISE_DIM = m.NOISE_DIM
+    CAT_DIM   = m.CAT_DIM
+    CONT_DIM  = m.CONT_DIM
+    N_CATS    = getattr(m, 'N_CATS', 1)
+    concat_latent = m.concat_latent
+    value_range = _get_value_range(dataset)
+
     fixed_noise = torch.FloatTensor(10, NOISE_DIM).uniform_(-1, 1).to(device)
     z_noise = fixed_noise.repeat_interleave(10, dim=0)
-    c_cat   = torch.zeros(100, CAT_DIM, device=device)
+
+    # Vary first categorical code
+    c_cat = torch.zeros(100, N_CATS * CAT_DIM, device=device)
     for i in range(10):
         c_cat[i*10:(i+1)*10, i] = 1.0
+        for j in range(1, N_CATS):
+            c_cat[i*10:(i+1)*10, j * CAT_DIM] = 1.0
+
     c_cont = torch.zeros(100, CONT_DIM, device=device)
     z = concat_latent(z_noise, c_cat, c_cont)
 
@@ -381,9 +401,7 @@ def plot_lambda_ablation(
     for ax, (label, G) in zip(axes, generators.items()):
         G.eval()
         imgs = G(z)
-        imgs = denorm(imgs, pixel_range)
-        _plot_grid(ax, imgs, 10, 10, pixel_range,
-                   title=f'{label}')
+        _plot_grid(ax, imgs, 10, 10, value_range, title=f'{label}')
 
     fig.suptitle('Effect of λ on disentanglement (c₁ traversal)', fontsize=13)
     plt.tight_layout()
@@ -402,16 +420,14 @@ def run_all(
     results_dir     : str  = 'results',
     device_str      : str  = 'cuda',
 ):
-    """
-    Load a saved checkpoint and generate all figures for the report.
-
-    Example:
-        python visualize.py --ckpt checkpoints/mnist_vanilla_final.pt
-    """
+    """Load a saved checkpoint and generate all figures for the report."""
     from datasets import build_loader
 
     device = torch.device(device_str if torch.cuda.is_available() else 'cpu')
-    meta   = DATASET_CFG[dataset]
+
+    m = _load_model_module(dataset)
+    Generator      = m.Generator
+    DiscriminatorQ = m.DiscriminatorQ
 
     G  = Generator().to(device)
     DQ = DiscriminatorQ().to(device)
@@ -428,15 +444,14 @@ def run_all(
     plot_latent_traversal(
         G, device,
         dataset     = dataset,
-        pixel_range = meta.pixel_range,
         save_path   = f'{results_dir}/{dataset}_{mode}_traversal.png',
     )
 
-    # 2. Classification error (MNIST only)
+    # 2. Classification error (MNIST only — SVHN labels are 1-9, not 0-9, and more complex)
     if dataset == 'mnist':
         test_loader = build_loader(dataset, batch_size=128,
                                    split='test', num_workers=2)
-        err = compute_classification_error(G, DQ, test_loader, device)
+        err = compute_classification_error(G, DQ, test_loader, device, dataset=dataset)
         print(f"  → Classification error: {err*100:.2f}%  (paper target: ~5%)")
 
 

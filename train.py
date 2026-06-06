@@ -24,6 +24,8 @@ Examples:
 
 import argparse
 from trainer import InfoGANTrainer, TrainerConfig, VALID_MODES
+import torch
+
 
 
 def parse_args():
@@ -55,6 +57,24 @@ def parse_args():
 def main():
     args = parse_args()
 
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location='cpu')
+        resumed_dataset = ckpt.get('dataset', args.dataset)
+        resumed_mode    = ckpt.get('mode', args.mode)
+        resumed_epoch   = ckpt.get('epoch', -1)
+        
+        if args.dataset != 'mnist' and args.dataset != resumed_dataset:
+            print(f"[Warning] Command line --dataset {args.dataset} conflicts with "
+                  f"checkpoint dataset '{resumed_dataset}'. Using checkpoint value.")
+        if args.mode != 'vanilla' and args.mode != resumed_mode:
+            print(f"[Warning] Command line --mode {args.mode} conflicts with "
+                  f"checkpoint mode '{resumed_mode}'. Using checkpoint value.")
+        
+        args.dataset = resumed_dataset
+        args.mode    = resumed_mode
+        print(f"[Resume] Loaded config from checkpoint: dataset={resumed_dataset}, "
+              f"mode={resumed_mode}, epoch={resumed_epoch}")
+
     cfg = TrainerConfig(
         mode            = args.mode,
         dataset         = args.dataset,
@@ -74,7 +94,8 @@ def main():
     trainer = InfoGANTrainer(cfg)
 
     if args.resume:
-        trainer.load_checkpoint(args.resume)
+        start_epoch = trainer.load_checkpoint(args.resume)
+        print(f"[Resume] Training will continue from epoch {start_epoch + 1}")
 
     trainer.train()
 
