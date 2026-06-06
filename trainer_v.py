@@ -420,9 +420,14 @@ class InfoGANTrainer:
     # Training loop
     # -----------------------------------------------------------------------
 
-    def train(self):
+    def train(self, start_epoch=0):
         cfg = self.cfg
-        for epoch in range(cfg.max_epochs):
+        end_epoch = cfg.max_epochs
+        if start_epoch > 0:
+            end_epoch = start_epoch + cfg.max_epochs
+            print(f"[Resume] Training from epoch {start_epoch} to {end_epoch - 1}")
+            
+        for epoch in range(start_epoch, end_epoch):
             self.G.train(); self.DQ.train()
             totals  = {k: 0.0 for k in
                        ['d_loss', 'g_loss', 'mi_disc', 'mi_cont', 'LI_disc']}
@@ -470,6 +475,8 @@ class InfoGANTrainer:
         tag  = 'final' if final else f'epoch{epoch:03d}'
         path = os.path.join(self.cfg.checkpoint_dir,
                             f"{self.cfg.dataset}_{self.cfg.mode}_{tag}.pt")
+        
+        # 保存完整的训练状态
         torch.save({
             'epoch'       : epoch,
             'mode'        : self.cfg.mode,
@@ -478,14 +485,28 @@ class InfoGANTrainer:
             'DQ_state'    : self.DQ.state_dict(),
             'opt_G_state' : self.opt_G.state_dict(),
             'opt_DQ_state': self.opt_DQ.state_dict(),
+            'rng_state'   : torch.get_rng_state(),           # CPU 随机状态
+            'cuda_rng_state': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         }, path)
         print(f'  Checkpoint → {path}')
 
+
     def load_checkpoint(self, path):
         ckpt = torch.load(path, map_location=self.device)
+        
+        # 加载模型权重
         self.G.load_state_dict(ckpt['G_state'])
         self.DQ.load_state_dict(ckpt['DQ_state'])
+        
+        # 加载优化器状态（注意：学习率等参数保持当前 cfg 的设置）
         self.opt_G.load_state_dict(ckpt['opt_G_state'])
         self.opt_DQ.load_state_dict(ckpt['opt_DQ_state'])
+        
+        # 恢复随机状态（保证可复现性）
+        if 'rng_state' in ckpt and ckpt['rng_state'] is not None:
+            torch.set_rng_state(ckpt['rng_state'])
+        if 'cuda_rng_state' in ckpt and ckpt['cuda_rng_state'] is not None:
+            torch.cuda.set_rng_state_all(ckpt['cuda_rng_state'])
+        
         print(f'  Checkpoint ← {path}  (epoch {ckpt["epoch"]})')
         return ckpt['epoch']
