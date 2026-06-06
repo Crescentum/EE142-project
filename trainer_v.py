@@ -392,6 +392,7 @@ class InfoGANTrainer:
         self.writer.add_image('traversal/c1_category', grid, epoch)
 
         NOISE_DIM = self.NOISE_DIM
+        CAT_DIM   = self.CAT_DIM
         CONT_DIM  = self.CONT_DIM
         N_CATS    = self.N_CATS
         device    = self.device
@@ -476,7 +477,6 @@ class InfoGANTrainer:
         path = os.path.join(self.cfg.checkpoint_dir,
                             f"{self.cfg.dataset}_{self.cfg.mode}_{tag}.pt")
         
-        # 保存完整的训练状态
         torch.save({
             'epoch'       : epoch,
             'mode'        : self.cfg.mode,
@@ -485,7 +485,7 @@ class InfoGANTrainer:
             'DQ_state'    : self.DQ.state_dict(),
             'opt_G_state' : self.opt_G.state_dict(),
             'opt_DQ_state': self.opt_DQ.state_dict(),
-            'rng_state'   : torch.get_rng_state(),           # CPU 随机状态
+            'rng_state'   : torch.get_rng_state(),         
             'cuda_rng_state': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         }, path)
         print(f'  Checkpoint → {path}')
@@ -494,15 +494,12 @@ class InfoGANTrainer:
     def load_checkpoint(self, path):
         ckpt = torch.load(path, map_location=self.device)
         
-        # 加载模型权重
         self.G.load_state_dict(ckpt['G_state'])
         self.DQ.load_state_dict(ckpt['DQ_state'])
         
-        # 加载优化器状态（注意：学习率等参数保持当前 cfg 的设置）
         self.opt_G.load_state_dict(ckpt['opt_G_state'])
         self.opt_DQ.load_state_dict(ckpt['opt_DQ_state'])
         
-        # 恢复随机状态（保证可复现性）
         if 'rng_state' in ckpt and ckpt['rng_state'] is not None:
             torch.set_rng_state(ckpt['rng_state'])
         if 'cuda_rng_state' in ckpt and ckpt['cuda_rng_state'] is not None:
