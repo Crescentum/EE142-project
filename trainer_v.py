@@ -13,7 +13,7 @@ Four resulting combinations (set via TrainerConfig):
 Model files (one per dataset, named model_<dataset>.py):
   model_mnist.py   ← already done
   model_svhn.py    ← done
-  model_celeba.py  ← B to implement
+  model_celeba.py  ← to implement
 
 Usage:
     cfg = TrainerConfig(mode='vanilla', dataset='mnist')
@@ -169,8 +169,6 @@ def mi_orig_discrete(c_cat, cat_prob, cat_dim):
         return F.cross_entropy(logits, targets)
 
 def mi_orig_continuous(c_cont, cont_mean, cont_std):
-    if c_cont.numel() == 0:
-        return c_cont.new_tensor(0.0)
     nll = (torch.log(cont_std + TINY)
            + 0.5 * ((c_cont - cont_mean) / (cont_std + TINY)) ** 2)
     return nll.mean()
@@ -218,7 +216,6 @@ class InfoGANTrainer:
         self.parse_q_output = m.parse_q_output
         self.NOISE_DIM      = m.NOISE_DIM
         self.CAT_DIM        = m.CAT_DIM
-        self.CAT_DIMS       = getattr(m, 'CAT_DIMS', (m.CAT_DIM,))
         self.CONT_DIM       = m.CONT_DIM
         self.N_CATS         = getattr(m, 'N_CATS', 1)
 
@@ -263,46 +260,24 @@ class InfoGANTrainer:
     # -----------------------------------------------------------------------
 
     def _make_fixed_latents(self):
+        B      = 100
         device = self.device
         NOISE_DIM = self.NOISE_DIM
+        CAT_DIM   = self.CAT_DIM
         CONT_DIM  = self.CONT_DIM
         N_CATS    = self.N_CATS
 
         base  = torch.FloatTensor(10, NOISE_DIM).uniform_(-1, 1)
         noise = base.repeat_interleave(10, dim=0).to(device)
 
-        # For multiple categorical codes: only vary the first code across rows
-        # Each row has a different class for c1, all other codes fixed to class 0
         c_cat = torch.zeros(B, N_CATS * CAT_DIM, device=device)
         for i in range(10):
-            # Set first categorical code to class i
             c_cat[i*10:(i+1)*10, i] = 1.0
-            # Other categorical codes remain at class 0 (already zero, one-hot at index 0)
             for j in range(1, N_CATS):
                 c_cat[i*10:(i+1)*10, j * CAT_DIM] = 1.0
 
         c_cont = torch.zeros(B, CONT_DIM, device=device)
         return noise, c_cat, c_cont
-
-    def _make_cat_traversal(self, code_idx, batch_size):
-        cat_dim = self.CAT_DIMS[code_idx]
-        n_cols = batch_size // cat_dim
-        c_cat = torch.zeros(batch_size, self.CAT_DIM, device=self.device)
-
-        offset = 0
-        for dim in self.CAT_DIMS:
-            c_cat[:, offset] = 1.0
-            offset += dim
-
-        start = sum(self.CAT_DIMS[:code_idx])
-        c_cat[:, start:start + cat_dim] = 0.0
-        for value in range(cat_dim):
-            row = slice(value * n_cols, (value + 1) * n_cols)
-            c_cat[row, start + value] = 1.0
-        return c_cat
-
-    def _cat_entropy_target(self):
-        return sum(math.log(dim) for dim in self.CAT_DIMS) / len(self.CAT_DIMS)
 
     # -----------------------------------------------------------------------
     # MI loss selector
@@ -331,7 +306,6 @@ class InfoGANTrainer:
 
         fake_imgs = self.G(z)
 
-        # D / Q update
         self.opt_DQ.zero_grad()
         real_d, _     = self.DQ(real_imgs)
         fake_d, q_out = self.DQ(fake_imgs.detach())
@@ -350,7 +324,6 @@ class InfoGANTrainer:
         (d_loss + mi_total).backward()
         self.opt_DQ.step()
 
-        # G update
         self.opt_G.zero_grad()
         fake_imgs_g       = self.G(z)
         fake_d_g, q_out_g = self.DQ(fake_imgs_g)
@@ -361,11 +334,11 @@ class InfoGANTrainer:
         mi_disc_g, mi_cont_g = self._mi_loss(c_cat, cat_prob_g, c_cont,
                                               cont_mean_g, cont_std_g)
         mi_total_g = cfg.lambda_disc * mi_disc_g + cfg.lambda_cont * mi_cont_g
-        (g_loss + mi_total_g).backward()
+        (g_loss - mi_total_g).backward()
         self.opt_G.step()
 
         with torch.no_grad():
-            li_disc = self._cat_entropy_target() - mi_disc.item()
+            li_disc = math.log(self.CAT_DIM) - mi_disc.item()
 
         return {
             'd_loss' : d_loss.item(),
@@ -397,10 +370,12 @@ class InfoGANTrainer:
         N_CATS    = self.N_CATS
         device    = self.device
 
+
         c0 = torch.zeros(10, N_CATS * CAT_DIM, device=device)
-        c0[:, 0] = 1.0
+        c0[:, 0] = 1.0  
         for j in range(1, N_CATS):
             c0[:, j * CAT_DIM] = 1.0
+
         zn = torch.zeros(10, NOISE_DIM, device=device)
         sweep = torch.linspace(-2, 2, 10, device=device)
 
@@ -427,7 +402,7 @@ class InfoGANTrainer:
         if start_epoch > 0:
             end_epoch = start_epoch + cfg.max_epochs
             print(f"[Resume] Training from epoch {start_epoch} to {end_epoch - 1}")
-            
+
         for epoch in range(start_epoch, end_epoch):
             self.G.train(); self.DQ.train()
             totals  = {k: 0.0 for k in
@@ -455,7 +430,7 @@ class InfoGANTrainer:
             print(f"Epoch {epoch:03d} | "
                   f"D={avg['d_loss']:.4f}  G={avg['g_loss']:.4f}  "
                   f"MI={avg['mi_disc']:.4f}  LI={avg['LI_disc']:.4f}  "
-                  f"target≈{self._cat_entropy_target():.3f}")
+                  f"target≈{math.log(self.CAT_DIM):.3f}")
             for k, v in avg.items():
                 self.writer.add_scalar(f'train/{k}', v, epoch)
 
