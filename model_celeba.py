@@ -1,13 +1,13 @@
 """
 InfoGAN network architectures for CelebA.
 
-CelebA uses 10 independent categorical latent codes with 10 categories each:
+CelebA uses one categorical latent code with 10 categories:
 
-    latent = [noise(128) || c1(10) || ... || c10(10)]
+    latent = [noise(128) || c1(10)]
 
-The generator maps this 228-D latent vector to a 64x64 RGB face image in
+The generator maps this 138-D latent vector to a 64x64 RGB face image in
 [-1, 1]. The discriminator and Q network share a convolutional trunk. D
-predicts real/fake, and Q predicts the posterior distribution of every
+predicts real/fake, and Q predicts the posterior distribution of the
 categorical code.
 """
 
@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from torch.nn.utils import spectral_norm
 
 
 NOISE_DIM = 128
-N_CATS = 10
+N_CATS = 1
 CAT_DIM = 10
 CAT_DIMS = (CAT_DIM,) * N_CATS
 CAT_TOTAL_DIM = N_CATS * CAT_DIM
@@ -39,32 +40,36 @@ def _weights_init(m):
 
 
 class Generator(nn.Module):
-    """Map a 228-D InfoGAN latent vector to a 64x64 RGB CelebA image."""
+    """Map a 138-D InfoGAN latent vector to a 64x64 RGB CelebA image."""
 
     def __init__(self, latent_dim: int = LATENT_DIM):
         super().__init__()
         self.latent_dim = latent_dim
 
         self.fc = nn.Sequential(
-            nn.Linear(latent_dim, 4 * 4 * 1024, bias=False),
-            nn.BatchNorm1d(4 * 4 * 1024),
+            nn.Linear(latent_dim, 4 * 4 * 512, bias=False),
+            nn.BatchNorm1d(4 * 4 * 512),
             nn.ReLU(inplace=True),
         )
 
-        self.deconv = nn.Sequential(
-            nn.ConvTranspose2d(1024, 512, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
-
-            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1, bias=False),
+        self.net = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(512, 256, kernel_size=3, stride=1, padding=1, bias=False),
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
 
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(256, 128, kernel_size=3, stride=1, padding=1, bias=False),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
 
-            nn.ConvTranspose2d(128, 3, kernel_size=4, stride=2, padding=1, bias=True),
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(64, 3, kernel_size=3, stride=1, padding=1, bias=True),
             nn.Tanh(),
         )
 
@@ -72,8 +77,8 @@ class Generator(nn.Module):
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         out = self.fc(z)
-        out = out.view(-1, 1024, 4, 4)
-        return self.deconv(out)
+        out = out.view(-1, 512, 4, 4)
+        return self.net(out)
 
 
 class DiscriminatorQ(nn.Module):
@@ -83,37 +88,31 @@ class DiscriminatorQ(nn.Module):
         super().__init__()
 
         self.shared_conv = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=4, stride=2, padding=1, bias=True),
+            spectral_norm(nn.Conv2d(3, 64, kernel_size=4, stride=2, padding=1, bias=True)),
             nn.LeakyReLU(0.1, inplace=True),
 
-            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(128),
+            spectral_norm(nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1, bias=True)),
             nn.LeakyReLU(0.1, inplace=True),
 
-            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(256),
+            spectral_norm(nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1, bias=True)),
             nn.LeakyReLU(0.1, inplace=True),
 
-            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(512),
+            spectral_norm(nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1, bias=True)),
             nn.LeakyReLU(0.1, inplace=True),
         )
 
         self.shared_fc = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(512 * 4 * 4, 1024, bias=False),
-            nn.BatchNorm1d(1024),
+            spectral_norm(nn.Linear(512 * 4 * 4, 1024, bias=True)),
             nn.LeakyReLU(0.1, inplace=True),
         )
 
         self.d_head = nn.Sequential(
-            nn.Linear(1024, 1),
-            nn.Sigmoid(),
+            spectral_norm(nn.Linear(1024, 1)),
         )
 
         self.q_head = nn.Sequential(
-            nn.Linear(1024, 128, bias=False),
-            nn.BatchNorm1d(128),
+            nn.Linear(1024, 128, bias=True),
             nn.LeakyReLU(0.1, inplace=True),
             nn.Linear(128, q_out_dim),
         )
