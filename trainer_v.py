@@ -77,7 +77,7 @@ class TrainerConfig:
     # training
     batch_size:        int   = 128
     max_epochs:        int   = 50
-    updates_per_epoch: int   = 100
+    updates_per_epoch: int   = 0
 
     # optimiser
     lr_d:       float = 2e-4
@@ -169,6 +169,8 @@ def mi_orig_discrete(c_cat, cat_prob, cat_dim):
         return F.cross_entropy(logits, targets)
 
 def mi_orig_continuous(c_cont, cont_mean, cont_std):
+    if c_cont.numel() == 0:
+        return c_cont.new_zeros(())
     nll = (torch.log(cont_std + TINY)
            + 0.5 * ((c_cont - cont_mean) / (cont_std + TINY)) ** 2)
     return nll.mean()
@@ -218,6 +220,10 @@ class InfoGANTrainer:
         self.CAT_DIM        = m.CAT_DIM
         self.CONT_DIM       = m.CONT_DIM
         self.N_CATS         = getattr(m, 'N_CATS', 1)
+
+        if self.CONT_DIM == 0 and cfg.lambda_cont != 0:
+            print("[Trainer] CONT_DIM=0, forcing lambda_cont=0.0")
+            cfg.lambda_cont = 0.0
 
         # ── networks ────────────────────────────────────────────────────────
         self.G  = m.Generator().to(self.device)
@@ -334,7 +340,7 @@ class InfoGANTrainer:
         mi_disc_g, mi_cont_g = self._mi_loss(c_cat, cat_prob_g, c_cont,
                                               cont_mean_g, cont_std_g)
         mi_total_g = cfg.lambda_disc * mi_disc_g + cfg.lambda_cont * mi_cont_g
-        (g_loss - mi_total_g).backward()
+        (g_loss + mi_total_g).backward()
         self.opt_G.step()
 
         with torch.no_grad():
@@ -408,7 +414,8 @@ class InfoGANTrainer:
             totals  = {k: 0.0 for k in
                        ['d_loss', 'g_loss', 'mi_disc', 'mi_cont', 'LI_disc']}
             data_it = iter(self.loader)
-            pbar    = tqdm(range(cfg.updates_per_epoch),
+            n_steps = cfg.updates_per_epoch if cfg.updates_per_epoch > 0 else len(self.loader)
+            pbar    = tqdm(range(n_steps),
                            desc=f'Epoch {epoch:03d}', leave=False)
 
             for _ in pbar:
@@ -425,7 +432,7 @@ class InfoGANTrainer:
                                  G=f"{logs['g_loss']:.3f}",
                                  LI=f"{logs['LI_disc']:.3f}")
 
-            n   = cfg.updates_per_epoch
+            n   = n_steps
             avg = {k: v / n for k, v in totals.items()}
             print(f"Epoch {epoch:03d} | "
                   f"D={avg['d_loss']:.4f}  G={avg['g_loss']:.4f}  "

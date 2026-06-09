@@ -1,14 +1,14 @@
 """
 InfoGAN network architectures for CelebA.
 
-CelebA in the InfoGAN paper uses 10 independent categorical latent codes,
-each with 10 categories. The generator maps the concatenated latent vector
+CelebA uses 10 independent categorical latent codes with 10 categories each:
 
-    z = [noise(128) || c_1(10) || ... || c_10(10)]
+    latent = [noise(128) || c1(10) || ... || c10(10)]
 
-to a 64x64 RGB face image in [-1, 1]. The discriminator and recognition
-network share a convolutional trunk; D predicts real/fake and Q predicts the
-posterior of each categorical code.
+The generator maps this 228-D latent vector to a 64x64 RGB face image in
+[-1, 1]. The discriminator and Q network share a convolutional trunk. D
+predicts real/fake, and Q predicts the posterior distribution of every
+categorical code.
 """
 
 from __future__ import annotations
@@ -18,11 +18,13 @@ import torch.nn as nn
 
 
 NOISE_DIM = 128
-CAT_DIMS = (10,) * 10
-CAT_DIM = sum(CAT_DIMS)
+N_CATS = 10
+CAT_DIM = 10
+CAT_DIMS = (CAT_DIM,) * N_CATS
+CAT_TOTAL_DIM = N_CATS * CAT_DIM
 CONT_DIM = 0
-LATENT_DIM = NOISE_DIM + CAT_DIM + CONT_DIM
-Q_OUT_DIM = CAT_DIM
+LATENT_DIM = NOISE_DIM + CAT_TOTAL_DIM + CONT_DIM
+Q_OUT_DIM = CAT_TOTAL_DIM
 IMAGE_VALUE_RANGE = (-1, 1)
 
 
@@ -127,26 +129,31 @@ class DiscriminatorQ(nn.Module):
 
 
 def parse_q_output(q_out: torch.Tensor):
-    """Return categorical probabilities and empty continuous posterior tensors."""
-    cat_probs = []
-    offset = 0
-    for dim in CAT_DIMS:
-        logits = q_out[:, offset:offset + dim]
-        cat_probs.append(torch.softmax(logits, dim=1))
-        offset += dim
+    """
+    Return categorical posteriors for the 10 code groups.
 
-    cat_prob = torch.cat(cat_probs, dim=1)
+    Returns:
+        cat_probs: list of 10 tensors, each shaped (B, 10)
+        cont_mean: empty tensor shaped (B, 0)
+        cont_std: empty tensor shaped (B, 0)
+    """
+    cat_probs = []
+    for i in range(N_CATS):
+        start = i * CAT_DIM
+        logits = q_out[:, start:start + CAT_DIM]
+        cat_probs.append(torch.softmax(logits, dim=1))
+
     empty = q_out.new_empty(q_out.size(0), 0)
-    return cat_prob, empty, empty
+    return cat_probs, empty, empty
 
 
 def sample_latent(batch_size: int, device: torch.device):
     z_noise = torch.empty(batch_size, NOISE_DIM, device=device).uniform_(-1, 1)
 
     codes = []
-    for dim in CAT_DIMS:
-        cat_idx = torch.randint(0, dim, (batch_size,), device=device)
-        c_i = torch.zeros(batch_size, dim, device=device)
+    for _ in range(N_CATS):
+        cat_idx = torch.randint(0, CAT_DIM, (batch_size,), device=device)
+        c_i = torch.zeros(batch_size, CAT_DIM, device=device)
         c_i.scatter_(1, cat_idx.unsqueeze(1), 1.0)
         codes.append(c_i)
 
@@ -158,8 +165,6 @@ def sample_latent(batch_size: int, device: torch.device):
 def concat_latent(z_noise: torch.Tensor,
                   c_cat: torch.Tensor,
                   c_cont: torch.Tensor) -> torch.Tensor:
-    if c_cont.numel() == 0:
-        return torch.cat([z_noise, c_cat], dim=1)
     return torch.cat([z_noise, c_cat, c_cont], dim=1)
 
 
@@ -173,14 +178,14 @@ if __name__ == "__main__":
     z = concat_latent(z_noise, c_cat, c_cont)
     fake_imgs = G(z)
     d_out, q_out = DQ(fake_imgs)
-    cat_prob, cont_mean, cont_std = parse_q_output(q_out)
+    cat_probs, cont_mean, cont_std = parse_q_output(q_out)
 
     print("=== CelebA shape checks ===")
     print(f"z         : {z.shape}")
     print(f"fake_imgs : {fake_imgs.shape}")
     print(f"d_out     : {d_out.shape}")
     print(f"q_out     : {q_out.shape}")
-    print(f"cat_prob  : {cat_prob.shape}")
+    print(f"cat_probs : {[p.shape for p in cat_probs]}")
     print(f"cont_mean : {cont_mean.shape}")
     print(f"cont_std  : {cont_std.shape}")
     print(f"image range: [{fake_imgs.min():.3f}, {fake_imgs.max():.3f}]")

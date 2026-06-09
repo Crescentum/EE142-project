@@ -25,6 +25,7 @@ Examples:
 import argparse
 import torch
 from trainer_v import InfoGANTrainer, TrainerConfig, VALID_MODES
+from datasets import DATASET_CFG
 
 
 def parse_args():
@@ -34,15 +35,17 @@ def parse_args():
     p.add_argument('--dataset',    type=str, default='mnist',
                    choices=['mnist', 'svhn', 'celeba'])
     p.add_argument('--epochs',     type=int, default=50)
+    p.add_argument('--updates_per_epoch', type=int, default=0,
+                   help='0 means one full pass over the DataLoader')
     p.add_argument('--batch_size', type=int, default=128)
     p.add_argument('--data_dir',   type=str, default='./data')
     p.add_argument('--log_dir',    type=str, default='./logs')
     p.add_argument('--ckpt_dir',   type=str, default='./checkpoints')
-    p.add_argument('--lr_d',       type=float, default=2e-4)
-    p.add_argument('--lr_g',       type=float, default=1e-3)
+    p.add_argument('--lr_d',       type=float, default=None)
+    p.add_argument('--lr_g',       type=float, default=None)
     p.add_argument('--lambda_gp',  type=float, default=10.0)
-    p.add_argument('--lambda_disc',type=float, default=1.0)
-    p.add_argument('--lambda_cont',type=float, default=0.1)
+    p.add_argument('--lambda_disc',type=float, default=None)
+    p.add_argument('--lambda_cont',type=float, default=None)
     p.add_argument('--infonce_temp',type=float, default=0.1)
     p.add_argument('--resume',     type=str, default=None,
                    help='path to .pt checkpoint to resume from')
@@ -69,19 +72,26 @@ def main():
         args.mode    = resumed_mode
         print(f"[Resume] Checkpoint: dataset={resumed_dataset}, mode={resumed_mode}, epoch={resumed_epoch}")
 
+    meta = DATASET_CFG[args.dataset]
+    lambda_disc = meta.lambda_disc if args.lambda_disc is None else args.lambda_disc
+    lambda_cont = meta.lambda_cont if args.lambda_cont is None else args.lambda_cont
+    lr_d = 2e-4 if args.lr_d is None else args.lr_d
+    lr_g = (2e-4 if args.dataset == 'celeba' else 1e-3) if args.lr_g is None else args.lr_g
+
     cfg = TrainerConfig(
         mode            = args.mode,
         dataset         = args.dataset,
         max_epochs      = args.epochs,
+        updates_per_epoch = args.updates_per_epoch,
         batch_size      = args.batch_size,
         data_dir        = args.data_dir,
         log_dir         = args.log_dir,
         checkpoint_dir  = args.ckpt_dir,
-        lr_d            = args.lr_d,
-        lr_g            = args.lr_g,
+        lr_d            = lr_d,
+        lr_g            = lr_g,
         lambda_gp       = args.lambda_gp,
-        lambda_disc     = args.lambda_disc,
-        lambda_cont     = args.lambda_cont,
+        lambda_disc     = lambda_disc,
+        lambda_cont     = lambda_cont,
         infonce_temp    = args.infonce_temp,
     )
 

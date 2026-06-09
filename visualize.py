@@ -86,6 +86,14 @@ def _render_grid(ax, imgs: torch.Tensor, n_cols: int, title: str):
     ax.axis('off')
 
 
+def _num_cat_codes(m) -> int:
+    return getattr(m, 'N_CATS', 1)
+
+
+def _cat_code_width(m) -> int:
+    return _num_cat_codes(m) * m.CAT_DIM
+
+
 # ---------------------------------------------------------------------------
 # Core grid builder — exact layout matching paper Figure 2
 #
@@ -110,6 +118,7 @@ def _make_c1_grid(G, m, device, pixel_range, n_rows=5, n_cols=10):
     NOISE_DIM = m.NOISE_DIM
     CAT_DIM   = m.CAT_DIM
     CONT_DIM  = m.CONT_DIM
+    N_CATS    = _num_cat_codes(m)
 
     # one z_noise vector per row, repeated across all 10 columns
     row_noises = torch.FloatTensor(n_rows, NOISE_DIM).uniform_(-1, 1).to(device)
@@ -118,10 +127,13 @@ def _make_c1_grid(G, m, device, pixel_range, n_rows=5, n_cols=10):
     # c1: column j → category j
     # Layout: indices 0..n_cols-1 = row 0, n_cols..2*n_cols-1 = row 1, etc.
     # (because repeat_interleave repeats each row n_cols times consecutively)
-    c_cat = torch.zeros(n_rows * n_cols, CAT_DIM, device=device)
+    c_cat = torch.zeros(n_rows * n_cols, _cat_code_width(m), device=device)
     for row in range(n_rows):
         for col in range(n_cols):
-            c_cat[row * n_cols + col, col] = 1.0
+            idx = row * n_cols + col
+            c_cat[idx, col] = 1.0
+            for code_idx in range(1, N_CATS):
+                c_cat[idx, code_idx * CAT_DIM] = 1.0
 
     c_cont = torch.zeros(n_rows * n_cols, CONT_DIM, device=device)
     z      = m.concat_latent(z_noise, c_cat, c_cont)
@@ -139,12 +151,15 @@ def _make_cont_grid(G, m, device, pixel_range, cont_idx=0,
     NOISE_DIM = m.NOISE_DIM
     CAT_DIM   = m.CAT_DIM
     CONT_DIM  = m.CONT_DIM
+    N_CATS    = _num_cat_codes(m)
 
     row_noises = torch.FloatTensor(n_rows, NOISE_DIM).uniform_(-1, 1).to(device)
     z_noise    = row_noises.repeat_interleave(n_cols, dim=0)
 
-    c_cat = torch.zeros(n_rows * n_cols, CAT_DIM, device=device)
+    c_cat = torch.zeros(n_rows * n_cols, _cat_code_width(m), device=device)
     c_cat[:, 0] = 1.0   # fix c1 to class 0
+    for code_idx in range(1, N_CATS):
+        c_cat[:, code_idx * CAT_DIM] = 1.0
 
     sweep  = torch.linspace(-cont_range, cont_range, n_cols, device=device)
     c_cont = torch.zeros(n_rows * n_cols, CONT_DIM, device=device)
@@ -187,7 +202,8 @@ def plot_figure2(
     G_infogan.eval()
 
     has_baseline = G_gan is not None
-    n_plots = 4 if has_baseline else 3
+    cont_plots = min(getattr(m, 'CONT_DIM', 0), 2)
+    n_plots = 1 + int(has_baseline) + cont_plots
 
     fig, axes = plt.subplots(1, n_plots, figsize=(n_plots * 3.5, n_rows * 0.7 + 1.2))
     if n_plots == 1:
@@ -196,7 +212,7 @@ def plot_figure2(
     # (a) InfoGAN c1 traversal
     imgs_a = _make_c1_grid(G_infogan, m, device, pixel_range, n_rows, n_cols)
     _render_grid(axes[0], imgs_a, n_cols,
-                 '(a) Varying $c_1$ on InfoGAN\n(Digit type)')
+                 '(a) Varying $c_1$ on InfoGAN')
 
     if has_baseline:
         # (b) GAN baseline c1 traversal — should look random
@@ -207,6 +223,14 @@ def plot_figure2(
         c_idx = 2   # (c) and (d) go to axes[2] and axes[3]
     else:
         c_idx = 1
+
+    if cont_plots == 0:
+        plt.suptitle('Manipulating categorical latent codes', fontsize=12, y=1.01)
+        plt.tight_layout()
+        plt.savefig(save_path, bbox_inches='tight', dpi=200)
+        plt.close()
+        print(f"  Figure 2 saved 鈫?{save_path}")
+        return
 
     # (c) c2 sweep — rotation
     imgs_c = _make_cont_grid(G_infogan, m, device, pixel_range,
