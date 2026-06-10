@@ -99,11 +99,6 @@ def main():
     print("[MNIST]")
     datasets.MNIST(root=DATA_DIR, train=True, download=True)
     datasets.MNIST(root=DATA_DIR, train=False, download=True)
-
-    print("[SVHN]")
-    datasets.SVHN(DATA_DIR, split="train", download=True)
-    datasets.SVHN(DATA_DIR, split="test", download=True)
-
     download_celeba()
     print("Done")
 
